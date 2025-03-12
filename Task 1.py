@@ -9,85 +9,67 @@ import numpy as np
 import os
 from PIL import Image
 
+class ResNet18Classifier(nn.Module):
+    def __init__(self, num_classes=3):
+        super(ResNet18Classifier, self).__init__()
+        self.model = models.resnet18(pretrained=True)
+        
+        in_features = self.model.fc.in_features
+        self.model.fc = nn.Linear(in_features, num_classes)
+        
+    def forward(self, x):
+        return self.model(x)
 
-class PathDataset(Dataset):
-    def __init__(self, image_dir, label_file, transform=None):
-        self.image_dir = image_dir
-        self.transform = transform
+# Hyperparameters
+batch_size = 16
+learning_rate = 0.001
+num_epochs = 30
 
-        # Load labels
-        self.labels = []
-        with open(label_file, 'r') as f:
-            for line in f.readlines():
-                parts = line.strip().split(',')
-                self.labels.append((parts[0], float(parts[1])))  # (filename, steering angle)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        img_name, steering_angle = self.labels[idx]
-        img_path = os.path.join(self.image_dir, img_name)
-        image = Image.open(img_path).convert("RGB")
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, torch.tensor([steering_angle], dtype=torch.float32)
-
-
-
-# Resize to 224 x 224 for ResNet15
+# Data transforms with augmentation and normalization
 transform = transforms.Compose([
-    transforms.Resize((224, 224)), 
+    transforms.Grayscale(),
+    transforms.Resize((224, 224)),  # ResNet18 expects 224x224 input
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize((0.5,), (0.5,)),
 ])
 
+# Load dataset
+train_dataset = datasets.ImageFolder(root='images', transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-#train_dataset = PathDataset(image_dir="data/train_images", label_file="data/train_labels.txt", transform=transform)
-#test_dataset = PathDataset(image_dir="data/test_images", label_file="data/test_labels.txt", transform=transform)
+# Initialize model, loss function, optimizer, and scheduler
+model = ResNet18Classifier(num_classes=3)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-
-# ResNet15 model
-class PathFollowingCNN(nn.Module):
-    def __init__(self):
-        super(PathFollowingCNN, self).__init__()
-        self.resnet = models.resnet18(pretrained=True)
-        self.resnet.fc = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)  # Output: Steering angle
-        )
-
-    def forward(self, x):
-        return self.resnet(x)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-model = PathFollowingCNN().to(device)
-criterion = nn.MSELoss()  # Regression loss for steering angles
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-
-num_epochs = 10  # You can increase this for better performance
-
+# Training loop
 for epoch in range(num_epochs):
     model.train()
-    total_loss = 0
+    running_loss = 0.0
+    correct = 0
+    total = 0
 
-    for images, angles in train_loader:
-        images, angles = images.to(device), angles.to(device)
-
+    for images, labels in train_loader:
         optimizer.zero_grad()
         outputs = model(images)
-        loss = criterion(outputs, angles)
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+        
+        # Accuracy calculation
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+        running_loss += loss.item()
 
-        total_loss += loss.item()
+    accuracy = 100 * correct / total
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}, Accuracy: {accuracy:.2f}%')
+    
+    # Step the scheduler
+    scheduler.step()
 
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(train_loader):.4f}")
+# Save the model
+torch.save(model.state_dict(), 'resnet18_line_follower.pth')
