@@ -28,7 +28,7 @@ num_epochs = 30
 # Data transforms with augmentation and normalization
 transform = transforms.Compose([
     transforms.Grayscale(),
-    transforms.Resize((224, 224)),  # ResNet18 expects 224x224 input
+    transforms.Resize((224, 224)), 
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
     transforms.ToTensor(),
