@@ -45,7 +45,7 @@ class Model:
         image (np.array) : BGR(A) array of image to analyze (From pyzed.sl.Mat().get_data())
 
         returns
-        (bytes) jpg image with bounding box of tracked object
+        tensor([x1, y1, x2, y2]) : top left and bottom right coordinates of bounding box (of type float)
         """
         self.result = self.yolo_model.track(image[:, :, :3], persist=True, classes=self.classes, verbose=False)[0]
         if not self.lost:
@@ -95,8 +95,6 @@ class Model:
 
             # if no suitable objects found
             return False
-
-        
 
     def _get_tracked_index(self):
         if self.result.boxes.id is None:
