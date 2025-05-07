@@ -1,0 +1,541 @@
+import cv2
+import numpy as np
+import ipywidgets as widgets
+from ipywidgets import interact
+from IPython.display import display
+import time
+import motors
+import cv2
+import pyzed.sl as sl
+import math
+import numpy as np
+import sys
+import threading
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import os
+from PIL import Image
+import motors
+
+def extract_yellow(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    lower_bound = np.array([30,40,120])
+    upper_bound = np.array([75, 255, 255])
+
+    mask = cv2.inRange(hsv, lower_bound, upper_bound)
+
+    return cv2.bitwise_and(frame, frame, mask=mask), mask
+
+def centre_rope(frame, mask):
+    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        x,y,w,h = cv2.boundingRect(largest_contour)
+        
+        rope_centre_x = x + w // 2
+        #return cropped_image, (centre_x, centre_y)
+        return rope_centre_x, mask
+    return None, mask
+
+#create widgets for the displaying of the image
+display_color = widgets.Image(format='jpeg', width='30%') #determine the width of the color image
+display_depth = widgets.Image(format='jpeg', width='30%')  #determine the width of the depth image
+layout=widgets.Layout(width='100%')
+sidebyside = widgets.HBox([display_color, display_depth],layout=layout) #horizontal 
+display(sidebyside)
+
+class Camera():
+    def __init__(self):
+        super(Camera, self).__init__()
+
+        self.zed = sl.Camera()
+        # Create a InitParameters object and set configuration parameters
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.VGA #VGA(672*376), HD720(1280*720), HD1080 (1920*1080) or ...
+        init_params.depth_mode = sl.DEPTH_MODE.ULTRA  # Use ULTRA depth mode
+        init_params.coordinate_units = sl.UNIT.MILLIMETER  # Use meter units (for depth measurements)
+
+        # Open the camera
+        status = self.zed.open(init_params)
+        if status != sl.ERROR_CODE.SUCCESS: #Ensure the camera has opened succesfully
+            print("Camera Open : "+repr(status)+". Exit program.")
+            self.zed.close()
+            exit(1)
+
+         # Create and set RuntimeParameters after opening the camera
+        self.runtime = sl.RuntimeParameters()
+
+        #flag to control the thread
+        self.thread_runnning_flag = False
+
+        # Get the height and width
+        camera_info = self.zed.get_camera_information()
+        self.width = camera_info.camera_configuration.resolution.width
+        self.height = camera_info.camera_configuration.resolution.height
+        self.image = sl.Mat(self.width,self.height,sl.MAT_TYPE.U8_C4, sl.MEM.CPU)
+        self.depth = sl.Mat(self.width,self.height,sl.MAT_TYPE.F32_C1, sl.MEM.CPU)
+        self.point_cloud = sl.Mat(self.width,self.height,sl.MAT_TYPE.F32_C4, sl.MEM.CPU)
+        self.output = None
+        self.color_value = None
+
+        self.count = 0
+
+    def _capture_frames(self):
+        while(self.thread_runnning_flag==True): #continue until the thread_runnning_flag is set to be False
+           
+            if self.zed.grab(self.runtime) == sl.ERROR_CODE.SUCCESS:
+                
+                
+                # Retrieve Left image
+                self.zed.retrieve_image(self.image, sl.VIEW.LEFT)
+                # Retrieve depth map. Depth is aligned on the left image
+                self.zed.retrieve_measure(self.depth, sl.MEASURE.DEPTH)
+                # Retrieve colored point cloud. Point cloud is aligned on the left image.
+                self.zed.retrieve_measure(self.point_cloud, sl.MEASURE.XYZRGBA)
+
+                self.color_value = self.image.get_data()
+                cv2.putText(self.color_value, 'o', (self.width//2,self.height//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                display_color.value = bgr8_to_jpeg(self.color_value)
+
+                
+                #self.output.write(self.color_value)
+                self.depth_image = np.asanyarray(self.depth.get_data())
+                depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(self.depth_image, alpha=0.03), cv2.COLORMAP_JET) 
+                cv2.putText(depth_colormap, str(self.depth_image[self.height//2,self.width//2]), (self.width//2,self.height//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                display_depth.value = bgr8_to_jpeg(depth_colormap)
+                
+                # # We measure the distance camera - object using Euclidean distance
+                x = round(self.width / 2)
+                y = round(self.height / 2)
+                err, point_cloud_value = self.point_cloud.get_value(x, y)  
+                # Your mission here 
+    
+    def start(self): #start the data capture thread
+        if self.thread_runnning_flag == False: #only process if no thread is running yet
+            self.thread_runnning_flag=True #flag to control the operation of the _capture_frames function
+            self.thread = threading.Thread(target=self._capture_frames) #link thread with the function
+            self.thread.start() #start the thread       
+
+    def stop(self): #stop the data capture thread
+        if self.thread_runnning_flag == True:
+            self.thread_runnning_flag = False #exit the while loop in the _capture_frames
+            self.thread.join() #wait the exiting of the thread    
+            self.output.release() 
+
+    def get_image(self):
+        image = self.color_value
+        return image
+
+def bgr8_to_jpeg(value):#convert numpy array to jpeg coded data for displaying 
+    return bytes(cv2.imencode('.jpg',value)[1])
+
+
+def move_robot(pred_direction, confidence=None, turn_sharpness=None):
+    # Enhanced base parameters for better performance
+    forward_speed = 0.7     # Significantly increased (was 0.45) for faster straight movement
+    forward_time = 0.1      # Slightly reduced for more responsive updates
+    
+    # Turn parameters - adjusted for better handling of sharp turns
+    left_speed = 0.3# Slightly increased (was 0.25)
+    left_time = 0.12         # Slightly increased for more deliberate turns
+    right_speed = 0.3       # Significantly increased (was 0.35) to handle right turns better
+    right_time = 0.12        # Increased duration for right turns (was 0.15)
+    
+    # Convert direction history to turn sharpness if not provided
+    if turn_sharpness is None and 'direction_history' in globals():
+        turn_sharpness = 0.5  # Default medium sharpness
+    
+    # Enhanced dynamic speed adjustments based on turn sharpness and confidence
+    if turn_sharpness is not None:
+        if turn_sharpness > 0.7:  # Sharp turn - stronger adjustment
+            left_speed = max(0.22, left_speed * 0.85)
+            left_time = min(0.22, left_time * 1.4)
+            right_speed = max(0.35, right_speed * 0.9)
+            right_time = min(0.30, right_time * 1.5)  # Much longer time for sharp right turns
+            forward_speed = max(0.3, forward_speed * 0.6)  # Significant deceleration before turns
+        elif turn_sharpness < 0.3:  # Gentle turn or straight - maximize speed
+            left_speed = min(0.38, left_speed * 1.25)
+            left_time = max(0.08, left_time * 0.8)
+            right_speed = min(0.50, right_speed * 1.1)
+            right_time = max(0.14, right_time * 0.9)
+            forward_speed = min(0.9, forward_speed * 1.3)  # Boost straight-line speed significantly
+    
+    # Special handling for right turns based on confidence
+    if confidence is not None and pred_direction == 2:  # Right turn
+        # Low confidence = stronger correction
+        if confidence < 0.7:  # Increased threshold (was 0.6)
+            right_speed = min(0.6, right_speed * 1.3)  # Stronger turn (was 1.3)
+            right_time = min(0.35, right_time * 1.4)   # Longer turn (was 1.4)
+        # Higher confidence but not certain
+        elif confidence < 0.85:
+            right_speed = min(0.55, right_speed * 1.2)
+            right_time = min(0.30, right_time * 1.3)
+    
+    # Execute the appropriate movement with enhanced strategies
+    if pred_direction == 0:  # Forward
+        # Check if we're coming from a turn and need to accelerate gradually
+        was_turning = False
+        if 'direction_history' in globals() and len(direction_history) > 0:
+            was_turning = direction_history[0] != 0
+        
+        if was_turning:
+            # Gradual acceleration after a turn
+            robot.forward(forward_speed * 0.6)
+            time.sleep(forward_time * 0.5)
+            robot.forward(forward_speed * 0.8)
+            time.sleep(forward_time * 0.5)
+        
+        # Full speed on straight sections
+        robot.forward(forward_speed)
+        time.sleep(forward_time)
+        
+        # Maintain momentum between forward movements
+        robot.forward(forward_speed * 0.7)  # Higher coasting speed (was 0.5)
+        return
+    
+    elif pred_direction == 1:  # Left turn
+        # Pre-emptive deceleration for smoother left turns
+        robot.forward(forward_speed * 0.4)  # Brake before turning
+        time.sleep(0.04)
+        
+        # Execute left turn with progressive speed control
+        robot.left(left_speed * 0.8)
+        time.sleep(left_time * 0.3)
+        robot.left(left_speed)
+        time.sleep(left_time * 0.7)
+        
+        # Gradual stop for smoother motion
+        robot.left(left_speed * 0.4)
+        time.sleep(0.03)
+        robot.stop()
+        return
+    
+    elif pred_direction == 2:  # Right turn - enhanced with multi-stage approach
+        # Strong pre-emptive deceleration for right turns
+        robot.forward(forward_speed * 0.3)  # Significant brake before turning
+        time.sleep(0.05)
+        
+        # Two-phase right turn for sharper corners
+        if turn_sharpness > 0.6:  # For sharp right turns
+            # Initial stronger turn phase
+            robot.right(right_speed * 0.8)
+            time.sleep(right_time * 0.6)
+            
+            # Second phase with adjusted angle
+            robot.right(right_speed * 0.7)
+            time.sleep(right_time * 0.4)
+        else:
+            # Standard right turn
+            robot.right(right_speed)
+            time.sleep(right_time)
+        
+        # Gradual stop for smoother motion
+        robot.right(right_speed * 0.3)
+        time.sleep(0.04)
+        robot.stop()
+        return
+    
+    else: 
+        robot.stop()
+        return
+
+
+class LineDirectionCNN(nn.Module):
+    def __init__(self):
+        super(LineDirectionCNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(64 * 112 * 112, 128)
+        self.fc2 = nn.Linear(128, 3)  # 3 output classes (forward, left, right)
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = x.view(-1, 64 * 112 * 112)  # Flatten the image tensor
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+        
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+robot = motors.MotorsYukon(mecanum=False)
+camera = Camera()
+camera.start()
+image_paths = []
+labels = []
+image_dir = 'images'
+categories = ['forward', 'left', 'right']
+for idx, category in enumerate(categories):
+    category_path = os.path.join(image_dir, category)
+    for filename in os.listdir(category_path):
+        if filename.endswith(".jpg") or filename.endswith(".png"):
+            image_paths.append(os.path.join(category_path, filename))
+            labels.append(idx)  # 0=forward, 1=left, 2=right
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Define the robot (Ensure motors module is correctly imported and initialized)
+robot = motors.MotorsYukon(mecanum=False)
+
+# Load the trained model
+model = LineDirectionCNN() 
+model.load_state_dict(torch.load("follower.pth"))
+model.eval()
+model.to(device)
+
+# Advanced parameters for adaptive movement control
+buffer = 0  # Direction buffer
+direction_history = [0, 0, 0, 0, 0]  # Expanded history for better pattern recognition
+confidence_history = [0.5, 0.5, 0.5]  # Track confidence values
+last_turn_time = time.time()
+turn_cooldown = 0.3  # Reduced cooldown for more responsive turning
+consecutive_same_direction = 0  # Track how many times we've gone the same direction
+speed_scale = 1.0  # Dynamic speed scaling
+last_five_directions = []  # For detecting oscillations
+oscillation_detected = False
+
+yellow_positions = []  
+max_positions = 10  
+
+adaptive_threshold = 1000  
+turn_sharpness = 0.5  
+
+# Initialize timers for performance measurement
+last_frame_time = time.time()
+fps_history = []
+
+while True:
+    start_time = time.time()
+    img = camera.get_image()
+
+    if img is not None:
+        # Calculate FPS for monitoring performance
+        current_time = time.time()
+        frame_time = current_time - last_frame_time
+        fps = 1.0 / max(0.001, frame_time)
+        fps_history.append(fps)
+        if len(fps_history) > 10:
+            fps_history.pop(0)
+        avg_fps = sum(fps_history) / len(fps_history)
+        last_frame_time = current_time
+        
+        h, w = img.shape[:2]
+        
+        # Improved asymmetric cropping to better detect right turns
+        margin_width_left = 180  # Reduced left margin (was 200)
+        margin_width_right = 120  # Significantly reduced right margin (was 160)
+        margin_height = 200      # Reduced top margin to see further ahead (was 220)
+        cropped_image = img[margin_height:, margin_width_left:w-margin_width_right]
+
+        h, w = cropped_image.shape[:2]
+        
+        # Extract the yellow line
+        frame, mask = extract_yellow(cropped_image)
+        
+        # Calculate yellow line position for turn sharpness detection
+        yellow_center, mask = centre_rope(frame, mask)
+        if yellow_center is not None:
+            normalized_position = yellow_center / w  # 0.0 (left) to 1.0 (right)
+            yellow_positions.append(normalized_position)
+            if len(yellow_positions) > max_positions:
+                yellow_positions.pop(0)
+                
+            # Enhanced turn sharpness calculation with position trend analysis
+            if len(yellow_positions) > 3:
+                position_variance = np.var(yellow_positions)
+                # Increase sensitivity to variance
+                turn_sharpness = min(1.0, position_variance * 25)  # Increased from *20
+                
+                # Calculate position trend to detect developing turns early
+                position_trend = 0
+                for i in range(len(yellow_positions)-1):
+                    position_trend += (yellow_positions[i+1] - yellow_positions[i])
+                
+                # Amplify turn sharpness for rapidly developing turns
+                if abs(position_trend) > 0.15:  # Threshold for rapid position change
+                    turn_sharpness = min(1.0, turn_sharpness * 1.3)
+                    
+                # Enhanced edge detection: more aggressive when line is very far to right or left
+                edge_factor = 5 * abs(normalized_position - 0.5)  # Increased from 4*
+                
+                # Special handling for right side positioning (preemptive right turn detection)
+                if normalized_position > 0.65:  # Line shifting to right side
+                    edge_factor *= 1.3  # Amplify edge factor for right side
+                    
+                turn_sharpness = max(turn_sharpness, edge_factor)
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   
+    
+        # Dynamic threshold based on recent history
+        threshold = adaptive_threshold
+        sum_pixel_values = np.sum(mask) / 255
+        
+        # Enhanced line loss handling with right-turn bias
+        if sum_pixel_values < threshold:
+            print(f"Low visibility ({sum_pixel_values:.0f}/{threshold}) - using guided navigation")
+            
+            # Analyze position history and trending for better recovery
+            right_bias = False
+            if yellow_positions and len(yellow_positions) >= 3:
+                # Check if line was trending toward right before disappearing
+                if yellow_positions[-1] > 0.55 or (yellow_positions[-1] > yellow_positions[-3] + 0.1):
+                    right_bias = True
+            
+            # More aggressive right turn recovery
+            if right_bias or (direction_history and direction_history[0] == 2):
+                move_robot(2, 0.4, 0.9)  # Lower confidence, higher sharpness for right recovery
+                print("Strong right recovery during low visibility")
+            elif direction_history and direction_history[0] == 1:
+                move_robot(1, 0.6, 0.7)  # Slightly more aggressive left recovery
+            else:
+                # Default with slight right bias (since right turns are problematic)
+                last_non_forward = next((d for d in direction_history if d != 0), 2)  # Default to right
+                move_robot(last_non_forward, 0.5, 0.6)
+            
+            # Update adaptive threshold
+            adaptive_threshold = max(700, adaptive_threshold * 0.92)
+            continue
+        else:
+            # Reset adaptive threshold toward baseline
+            adaptive_threshold = threshold * 0.9 + 1000 * 0.1
+        
+        # Prepare image for model prediction
+        pil_img = Image.fromarray(frame_rgb)
+        input_tensor = transform(pil_img).unsqueeze(0).to(device)
+
+        # Get model prediction with confidence scores
+        with torch.no_grad():
+            output = model(input_tensor)
+            probabilities = torch.nn.functional.softmax(output, dim=1)
+            
+            # Get confidence scores for all directions
+            forward_conf = probabilities[0][0].item()
+            left_conf = probabilities[0][1].item()
+            right_conf = probabilities[0][2].item()
+            
+            confidence, predicted = torch.max(probabilities, 1)
+            pred_direction = predicted.item()
+            confidence_value = confidence.item()
+            
+            # Enhanced right-turn detection: Boost right turn likelihood when near right edge
+            if yellow_center is not None:
+                right_bias = normalized_position > 0.62  # Reduced threshold (was ~0.65)
+                if right_bias and right_conf > 0.25:  # More sensitive right detection
+                    if right_conf > forward_conf * 0.7:  # If right is remotely competitive with forward
+                        pred_direction = 2  # Override to right turn
+                        confidence_value = max(right_conf, confidence_value * 0.9)  # Preserve confidence
+                        print("Right turn detection boosted due to line position")
+        
+        # Check for direction oscillation
+        last_five_directions.append(pred_direction)
+        if len(last_five_directions) > 5:
+            last_five_directions.pop(0)
+            
+        # Enhanced oscillation detection with specific patterns
+        oscillation_detected = False
+        if len(last_five_directions) == 5:
+            # Detect standard oscillation
+            alternating = True
+            for i in range(len(last_five_directions)-1):
+                if last_five_directions[i] == last_five_directions[i+1]:
+                    alternating = False
+                    break
+            
+            # Detect right-forward oscillation (common problem pattern)
+            right_forward_oscillation = (
+                last_five_directions.count(0) >= 2 and 
+                last_five_directions.count(2) >= 2 and
+                last_five_directions[0] != last_five_directions[1]
+            )
+            
+            oscillation_detected = alternating or right_forward_oscillation
+        
+        # Track consecutive same directions
+        if len(direction_history) > 0 and pred_direction == direction_history[0]:
+            consecutive_same_direction += 1
+        else:
+            consecutive_same_direction = 0
+            
+        # Update direction and confidence history
+        direction_history.pop()
+        direction_history.insert(0, pred_direction)
+        confidence_history.pop(0)
+        confidence_history.append(confidence_value)
+        
+        # Calculate average confidence
+        avg_confidence = sum(confidence_history) / len(confidence_history)
+        
+        # Enhanced diagnostics with normalized position information
+        line_pos_str = f"Line pos: {normalized_position:.2f}" if yellow_center is not None else "Line: N/A"
+        print(f"Dir: {pred_direction}, Conf: {confidence_value:.2f}, {line_pos_str}, Sharp: {turn_sharpness:.2f}, FPS: {avg_fps:.1f}")
+        
+        # Decision making logic with anti-oscillation and enhanced right turn handling
+        current_time = time.time()
+        cooldown_active = (current_time - last_turn_time) < turn_cooldown
+        
+        # if oscillation_detected:
+        #     print("Oscillation detected - stabilizing")
+        #     # Stronger bias toward right turns during oscillation (since they're problematic)
+        #     if forward_conf > 0.4:
+        #         move_robot(0, forward_conf, 0.3)  # Go forward to reset
+        #     elif left_conf > right_conf:
+        #         move_robot(1, left_conf, 0.7)  # Decisive left turn
+        #     else:
+        #         move_robot(2, 0.5, 0.5)  # Default to right turn with medium sharpness
+            
+        #     # Reset oscillation detection
+        #     last_five_directions = [pred_direction] * 5
+            
+        if pred_direction == 2:  # Right turn - enhanced handling
+            # Boost confidence and commit more strongly to right turns
+            effective_confidence = min(0.75, confidence_value * 1)  # Boost confidence
+            
+            if cooldown_active and consecutive_same_direction < 2:
+                # More aggressive initial right turn to prevent missing turns
+                move_robot(2, effective_confidence, max(turn_sharpness * 1.2, 0.5))
+                print("Right turn (enhanced initial)")
+            else:
+                # Stronger overall right turn with increased sharpness
+                move_robot(2, effective_confidence, max(turn_sharpness * 1.1, 0.4))
+                print("Right turn (standard enhanced)")
+                
+            last_turn_time = current_time
+                
+        elif pred_direction == 1:  # Left turn - standard handling
+            if cooldown_active and consecutive_same_direction < 2:
+                move_robot(1, confidence_value, turn_sharpness * 0.9)
+            else:
+                move_robot(1, confidence_value, turn_sharpness)
+                
+            last_turn_time = current_time
+                
+        else:  # Forward movement with speed optimization
+            # Progressive speed increase on straight sections
+            if consecutive_same_direction > 6:
+                # If going straight for a while, significantly increase speed
+                move_robot(0, confidence_value, min(0.2, turn_sharpness * 0.7))  # Reduced sharpness for speed
+                if consecutive_same_direction > 10:
+                    print("Maximum straight-line speed")
+            else:
+                move_robot(0, confidence_value, min(0.4, turn_sharpness))
+        
+        # Update buffer for next iteration
+        buffer = pred_direction
+        
+        # Adaptive processing rate
+        elapsed = time.time() - start_time
+        target_time = 0.025  # ~40 fps target (increased from 33fps)
+        if elapsed < target_time:
+            time.sleep(target_time - elapsed)
