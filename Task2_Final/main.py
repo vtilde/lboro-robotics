@@ -23,7 +23,6 @@ class Model:
         # Tolerance threshold for redetection if tracking is lost
         self.redetect_within = 50
 
-    # Display all detected boxes
     def show_all_boxes(self, image):
         """
         Run detection and return the image with all bounding boxes drawn.
@@ -152,8 +151,6 @@ class Model:
 
             # if no suitable objects found
             return False
-
-        
 
     def _get_tracked_index(self):
         """
